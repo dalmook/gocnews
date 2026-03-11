@@ -614,6 +614,57 @@ def build_fallback_plan(mails: List[MailItem], editor_note: str) -> Dict[str, An
     }
 
 
+def build_category_bridge_articles(mails: List[MailItem], covered_categories: Optional[set] = None) -> List[Dict[str, Any]]:
+    if covered_categories is None:
+        covered_categories = set()
+
+    grouped: Dict[str, List[tuple]] = {}
+    for idx, mail in enumerate(mails, start=1):
+        category = get_mail_category(mail.subject)
+        grouped.setdefault(category, []).append((idx, mail))
+
+    articles = []
+    for category in FILTER_KEYWORDS:
+        if category not in grouped or category in covered_categories:
+            continue
+        lead_idx, lead_mail = grouped[category][0]
+        style = CATEGORY_STYLES.get(category, CATEGORY_STYLES["기타"])
+        articles.append({
+            "headline": f"{style['label']} 주요 메일",
+            "summary": summarize_text(lead_mail.body, 260) or lead_mail.subject,
+            "bullets": [f"{len(grouped[category])}건 메일 반영", lead_mail.subject[:100]],
+            "related_mail_indexes": [lead_idx]
+        })
+    return articles
+
+
+def ensure_category_coverage(plan: Dict[str, Any], mails: List[MailItem]) -> Dict[str, Any]:
+    covered_categories = set()
+
+    top_indexes = plan.get("top_story", {}).get("related_mail_indexes", []) or []
+    for idx in top_indexes:
+        if 1 <= idx <= len(mails):
+            covered_categories.add(get_mail_category(mails[idx - 1].subject))
+
+    for sec in plan.get("sections", []) or []:
+        for article in sec.get("articles", []) or []:
+            for idx in article.get("related_mail_indexes", []) or []:
+                if 1 <= idx <= len(mails):
+                    covered_categories.add(get_mail_category(mails[idx - 1].subject))
+
+    missing_articles = build_category_bridge_articles(mails, covered_categories)
+    if not missing_articles:
+        return plan
+
+    sections = plan.get("sections", []) or []
+    sections.append({
+        "section_name": "카테고리 브리핑",
+        "articles": missing_articles
+    })
+    plan["sections"] = sections
+    return plan
+
+
 def normalize_plan(data: Dict[str, Any], mails: List[MailItem]) -> Dict[str, Any]:
     top = data.get("top_story") or {}
     sections = data.get("sections") or []
@@ -643,7 +694,7 @@ def normalize_plan(data: Dict[str, Any], mails: List[MailItem]) -> Dict[str, Any
                 "articles": normalized_articles
             })
 
-    return {
+    normalized = {
         "paper_title": get_newsletter_title(),
         "paper_subtitle": clean_text(str(data.get("paper_subtitle") or f"최근 {DEFAULT_LOOKBACK_DAYS}일 메일 요약"))[:160],
         "top_story": {
@@ -656,6 +707,7 @@ def normalize_plan(data: Dict[str, Any], mails: List[MailItem]) -> Dict[str, Any
         "sections": normalized_sections,
         "editor_note": clean_text(str(data.get("editor_note") or "주요 이슈를 주제별로 재정리했습니다."))[:220]
     }
+    return ensure_category_coverage(normalized, mails)
 
 
 def try_parse_plan_json(raw_content: str) -> Optional[Dict[str, Any]]:
