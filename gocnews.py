@@ -353,6 +353,27 @@ def extract_important_summary_text(text: str, max_sentences: int = 3) -> str:
     return clean_text(" ".join(sentence for _, sentence, _ in important))
 
 
+def extract_key_points(text: str, max_points: int = 3) -> List[str]:
+    cleaned = remove_structural_lines(text)
+    sentences = split_sentences(cleaned)
+    if not sentences:
+        return []
+
+    scored = [(idx, sentence, score_sentence(sentence)) for idx, sentence in enumerate(sentences)]
+    scored = sorted(scored, key=lambda item: (-item[2], item[0]))
+
+    points = []
+    for _, sentence, score in scored:
+        if score <= 0 and points:
+            continue
+        sentence = summarize_text(sentence, 120) if len(sentence) > 120 else sentence
+        if sentence and sentence not in points:
+            points.append(sentence)
+        if len(points) >= max_points:
+            break
+    return points
+
+
 def summarize_text(text: str, max_length: int = 180) -> str:
     text = extract_important_summary_text(text) or remove_structural_lines(text) or clean_text(text)
     if len(text) <= max_length:
@@ -558,14 +579,21 @@ def build_mail_bundle_for_llm(mails: List[MailItem]) -> str:
     blocks = []
     for idx, m in enumerate(mails, start=1):
         dt = m.date_obj.strftime("%Y-%m-%d %H:%M") if m.date_obj else m.date_str
+        category = get_mail_category(m.subject)
+        cleaned_subject = clean_subject_for_title(m.subject)
         compact_summary = summarize_text(m.body, 320)
+        key_points = extract_key_points(m.body, 3)
+        key_points_text = "\n".join(f"- {point}" for point in key_points) if key_points else "- 핵심 포인트 추출 실패"
         block = f"""
 [메일 {idx}]
-제목: {m.subject}
+카테고리: {category}
+제목: {cleaned_subject}
 발신자: {m.sender}
 일시: {dt}
 본문 요약:
 {compact_summary}
+핵심 포인트:
+{key_points_text}
 """
         blocks.append(block.strip())
     return "\n\n".join(blocks)
@@ -866,6 +894,10 @@ def generate_newspaper_plan(mails: List[MailItem]) -> Optional[Dict[str, Any]]:
 - 기사 문체는 간결하고 신문형
 - 과장 금지, 원문 기반
 - 없는 내용 지어내지 말 것
+- 중요도 판단 기준은 일정 영향, 생산/수율 영향, 고객/출하 영향, 리스크, 의사결정 필요성, 긴급 요청 여부
+- 단순 참고 공지보다 실행 필요 항목, 이슈, 변화, 지연, 원인/대응이 드러나는 메일을 우선 반영
+- summary는 원문 재복붙이 아니라 핵심 의미를 2~4문장으로 재구성
+- bullets는 수치, 일정, 리스크, 요청, 조치 중 핵심만 짧게 정리
 - 모든 문자열은 JSON 규칙에 맞게 큰따옴표 내부에만 작성
 - JSON 바깥 텍스트 절대 출력 금지
 - 기사 headline, subheadline, section_name은 자연스럽고 읽기 쉬운 제목으로 작성
@@ -880,6 +912,7 @@ def generate_newspaper_plan(mails: List[MailItem]) -> Optional[Dict[str, Any]]:
     user_prompt = f"""
 아래 메일 묶음은 최근 {DEFAULT_LOOKBACK_DAYS}일 동안 수집된 전체 메일 {len(mails)}건입니다.
 모든 메일을 빠짐없이 훑고, 반복되는 주제는 합치되 특정 카테고리나 후반부 메일이 누락되지 않게 편집하세요.
+각 메일에 포함된 '핵심 포인트'를 우선 참고하고, 공지성 문구보다 실제 이슈와 액션이 드러나도록 정리하세요.
 오늘의 사내 신문 편집본 JSON을 생성하세요.
 
 {bundle}
@@ -890,8 +923,8 @@ def generate_newspaper_plan(mails: List[MailItem]) -> Optional[Dict[str, Any]]:
         result = call_gpt_oss(
             prompt=user_prompt,
             system_prompt=system_prompt,
-            temperature=0.2,
-            max_tokens=2200
+            temperature=0.1,
+            max_tokens=2800
         )
 
         if "error" in result:
