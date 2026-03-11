@@ -199,6 +199,15 @@ def extract_json_block(text: str) -> str:
     return text.strip()
 
 
+def extract_outer_json_object(text: str) -> str:
+    text = extract_json_block(text)
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1]
+    return text
+
+
 # =========================================================
 # POP3 메일 읽기
 # =========================================================
@@ -255,9 +264,13 @@ def trim_mail_body(text: str, max_len: int = 1800) -> str:
         return ""
     # 회신/전달 흔적 이후 잘라내기
     split_patterns = [
+        r"(?im)^[-\s]*Original Message[-\s]*$",
         r"\n[-]{2,}\s*Original Message\s*[-]{2,}",
         r"\n보낸 사람\s*:",
         r"\nFrom\s*:",
+        r"\nSender\s*:",
+        r"\nDate\s*:",
+        r"\nTitle\s*:",
         r"\n-----Original Message-----",
         r"\n발신\s*:",
     ]
@@ -266,6 +279,8 @@ def trim_mail_body(text: str, max_len: int = 1800) -> str:
         if m:
             text = text[:m.start()]
             break
+    text = clean_text(text)
+    text = re.sub(r"(?im)^(sender|date|title)\s*:\s*.*$", "", text)
     text = clean_text(text)
     if len(text) > max_len:
         text = text[:max_len] + " ..."
@@ -421,6 +436,137 @@ def build_mail_bundle_for_llm(mails: List[MailItem]) -> str:
     return "\n\n".join(blocks)
 
 
+def build_fallback_plan(mails: List[MailItem], editor_note: str) -> Dict[str, Any]:
+    if not mails:
+        return {
+            "paper_title": "오늘의 사내 메일 브리핑",
+            "paper_subtitle": "수집된 메일이 없어 편집본을 생성하지 못했습니다.",
+            "top_story": {
+                "headline": "수집된 메일 없음",
+                "subheadline": "",
+                "summary": "",
+                "bullets": [],
+                "related_mail_indexes": []
+            },
+            "sections": [],
+            "editor_note": editor_note
+        }
+
+    top_mail = mails[0]
+    issue_articles = []
+    for idx, mail in enumerate(mails[1:5], start=2):
+        issue_articles.append({
+            "headline": mail.subject,
+            "summary": clean_text(mail.body)[:220],
+            "bullets": [],
+            "related_mail_indexes": [idx]
+        })
+
+    return {
+        "paper_title": datetime.now().strftime("%Y-%m-%d 사내 메일 브리핑"),
+        "paper_subtitle": f"최근 {DEFAULT_LOOKBACK_DAYS}일 기준 주요 메일 {len(mails)}건 요약",
+        "top_story": {
+            "headline": top_mail.subject,
+            "subheadline": clean_text(top_mail.sender),
+            "summary": clean_text(top_mail.body)[:360],
+            "bullets": [],
+            "related_mail_indexes": [1]
+        },
+        "sections": [
+            {
+                "section_name": "주요 메일",
+                "articles": issue_articles
+            }
+        ],
+        "editor_note": editor_note
+    }
+
+
+def normalize_plan(data: Dict[str, Any], mails: List[MailItem]) -> Dict[str, Any]:
+    top = data.get("top_story") or {}
+    sections = data.get("sections") or []
+    if not isinstance(sections, list):
+        sections = []
+
+    normalized_sections = []
+    for sec in sections[:4]:
+        if not isinstance(sec, dict):
+            continue
+        articles = sec.get("articles") or []
+        if not isinstance(articles, list):
+            articles = []
+        normalized_articles = []
+        for article in articles[:6]:
+            if not isinstance(article, dict):
+                continue
+            normalized_articles.append({
+                "headline": str(article.get("headline") or "제목 없음").strip(),
+                "summary": clean_text(str(article.get("summary") or ""))[:400],
+                "bullets": [clean_text(str(b))[:120] for b in (article.get("bullets") or []) if str(b).strip()][:4],
+                "related_mail_indexes": [int(i) for i in (article.get("related_mail_indexes") or []) if isinstance(i, int)]
+            })
+        if normalized_articles:
+            normalized_sections.append({
+                "section_name": str(sec.get("section_name") or "주요 기사").strip(),
+                "articles": normalized_articles
+            })
+
+    return {
+        "paper_title": str(data.get("paper_title") or datetime.now().strftime("%Y-%m-%d 사내 메일 브리핑")).strip(),
+        "paper_subtitle": clean_text(str(data.get("paper_subtitle") or f"최근 {DEFAULT_LOOKBACK_DAYS}일 메일 요약"))[:160],
+        "top_story": {
+            "headline": str(top.get("headline") or (mails[0].subject if mails else "오늘의 주요 이슈")).strip(),
+            "subheadline": clean_text(str(top.get("subheadline") or ""))[:180],
+            "summary": clean_text(str(top.get("summary") or (mails[0].body[:300] if mails else "")))[:500],
+            "bullets": [clean_text(str(b))[:120] for b in (top.get("bullets") or []) if str(b).strip()][:5],
+            "related_mail_indexes": [int(i) for i in (top.get("related_mail_indexes") or []) if isinstance(i, int)]
+        },
+        "sections": normalized_sections,
+        "editor_note": clean_text(str(data.get("editor_note") or "주요 이슈를 주제별로 재정리했습니다."))[:220]
+    }
+
+
+def try_parse_plan_json(raw_content: str) -> Optional[Dict[str, Any]]:
+    candidates = [
+        raw_content,
+        extract_json_block(raw_content),
+        extract_outer_json_object(raw_content),
+    ]
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            continue
+    return None
+
+
+def repair_plan_json(raw_content: str) -> Optional[Dict[str, Any]]:
+    repair_system_prompt = """
+당신은 깨진 JSON을 복구하는 도우미입니다.
+입력 내용을 보고 반드시 유효한 JSON 객체 하나만 출력하세요.
+설명, 코드블록, 주석은 금지입니다.
+"""
+    repair_user_prompt = f"""
+아래 콘텐츠를 유효한 JSON 객체로 복구하세요.
+누락된 값은 문맥상 최소한으로만 보완하고, 스키마는 유지하세요.
+
+{extract_outer_json_object(raw_content)}
+"""
+    repaired = call_gpt_oss(
+        prompt=repair_user_prompt,
+        system_prompt=repair_system_prompt,
+        temperature=0.0,
+        max_tokens=2200
+    )
+    if "error" in repaired:
+        return None
+    repaired_content = repaired.get("choices", [{}])[0].get("message", {}).get("content", "")
+    return try_parse_plan_json(repaired_content)
+
+
 def generate_newspaper_plan(mails: List[MailItem]) -> Dict[str, Any]:
     bundle = build_mail_bundle_for_llm(mails)
 
@@ -477,6 +623,8 @@ def generate_newspaper_plan(mails: List[MailItem]) -> Dict[str, Any]:
 - 기사 문체는 간결하고 신문형
 - 과장 금지, 원문 기반
 - 없는 내용 지어내지 말 것
+- 모든 문자열은 JSON 규칙에 맞게 큰따옴표 내부에만 작성
+- JSON 바깥 텍스트 절대 출력 금지
 """
 
     user_prompt = f"""
@@ -493,52 +641,15 @@ def generate_newspaper_plan(mails: List[MailItem]) -> Dict[str, Any]:
     )
 
     if "error" in result:
-        return {
-            "paper_title": "오늘의 사내 메일 브리핑",
-            "paper_subtitle": f"LLM 편집 실패: {result['error']}",
-            "top_story": {
-                "headline": mails[0].subject if mails else "메일 없음",
-                "subheadline": "자동 편집 실패",
-                "summary": mails[0].body[:300] if mails else "",
-                "bullets": [],
-                "related_mail_indexes": [1] if mails else []
-            },
-            "sections": [],
-            "editor_note": "LLM 응답을 받지 못해 기본 형태로 생성되었습니다."
-        }
+        return build_fallback_plan(mails, "자동 편집 응답을 받지 못해 원문 기반 브리핑으로 대체했습니다.")
 
-    try:
-        content = result["choices"][0]["message"]["content"]
-        content = extract_json_block(content)
-        data = json.loads(content)
-        return data
-    except Exception as e:
-        raw = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-        return {
-            "paper_title": "오늘의 사내 메일 브리핑",
-            "paper_subtitle": "LLM 응답 파싱 실패",
-            "top_story": {
-                "headline": mails[0].subject if mails else "메일 없음",
-                "subheadline": "원문 기반 임시 기사",
-                "summary": mails[0].body[:300] if mails else "",
-                "bullets": [],
-                "related_mail_indexes": [1] if mails else []
-            },
-            "sections": [
-                {
-                    "section_name": "원본 응답",
-                    "articles": [
-                        {
-                            "headline": "LLM 원문",
-                            "summary": raw[:1200],
-                            "bullets": [],
-                            "related_mail_indexes": []
-                        }
-                    ]
-                }
-            ],
-            "editor_note": f"파싱 오류: {e}"
-        }
+    raw_content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+    parsed = try_parse_plan_json(raw_content)
+    if parsed is None:
+        parsed = repair_plan_json(raw_content)
+    if parsed is None:
+        return build_fallback_plan(mails, "자동 편집 형식을 복구하지 못해 원문 기반 브리핑으로 대체했습니다.")
+    return normalize_plan(parsed, mails)
 
 
 # =========================================================
@@ -601,12 +712,13 @@ def render_article_card(article: Dict[str, Any], mails: List[MailItem]) -> str:
 
     return f"""
     <tr>
-        <td style="padding:0 0 16px 0;">
-            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #d9d2c1;background:#ffffff;">
+        <td style="padding:0 0 18px 0;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #d7cfbf;background:#ffffff;">
                 <tr>
-                    <td style="padding:18px 20px 20px 20px;">
-                        <div style="font-size:24px;line-height:1.4;font-weight:700;color:#1d1d1d;">{esc(article.get("headline"))}</div>
-                        <div style="padding-top:10px;font-size:15px;line-height:1.8;color:#2f2b25;">{esc_br(article.get("summary"))}</div>
+                    <td style="padding:20px 22px 22px 22px;">
+                        <div style="font-size:12px;line-height:1.2;font-weight:700;letter-spacing:1px;color:#8a7b62;text-transform:uppercase;">Brief</div>
+                        <div style="padding-top:8px;font-size:25px;line-height:1.35;font-weight:700;color:#161616;">{esc(article.get("headline"))}</div>
+                        <div style="padding-top:12px;font-size:15px;line-height:1.9;color:#2f2b25;">{esc_br(article.get("summary"))}</div>
                         {bullets_html}
                         {source_html}
                     </td>
@@ -649,36 +761,50 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
 <meta charset="utf-8">
 <title>{esc(plan.get("paper_title", "사내 메일 신문"))}</title>
 </head>
-<body style="margin:0;padding:0;background-color:#efe9dc;">
-    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;margin:0;padding:24px 0;background-color:#efe9dc;">
+<body style="margin:0;padding:0;background-color:#e7dfd1;">
+    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">
+        {esc(plan.get("paper_subtitle", "사내 메일 브리핑"))}
+    </div>
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;margin:0;padding:32px 0;background-color:#e7dfd1;">
         <tr>
             <td align="center">
-                <table role="presentation" width="760" cellpadding="0" cellspacing="0" style="width:760px;max-width:760px;background-color:#fffdf8;border:1px solid #d4cdbf;font-family:'Malgun Gothic','Apple SD Gothic Neo',Arial,sans-serif;color:#1d1d1d;">
+                <table role="presentation" width="760" cellpadding="0" cellspacing="0" style="width:760px;max-width:760px;background-color:#fcfaf4;border:1px solid #cfc4af;font-family:'Malgun Gothic','Apple SD Gothic Neo',Arial,sans-serif;color:#1d1d1d;">
                     <tr>
-                        <td style="padding:28px 30px 18px 30px;text-align:center;background-color:#fbf6ea;border-bottom:4px double #222222;">
-                            <div style="font-size:42px;line-height:1.1;font-weight:700;letter-spacing:2px;">{esc(plan.get("paper_title", "GOC DAILY MAIL TIMES"))}</div>
-                            <div style="padding-top:8px;font-size:15px;line-height:1.5;color:#666666;">{esc(plan.get("paper_subtitle", "사내 메일 자동 편집 신문"))}</div>
+                        <td style="padding:14px 30px;background-color:#1a1a1a;text-align:center;">
+                            <div style="font-size:12px;line-height:1.4;font-weight:700;letter-spacing:1.6px;color:#f3ead7;">GOC INTERNAL EDITION</div>
                         </td>
                     </tr>
                     <tr>
-                        <td style="padding:10px 20px;border-bottom:1px solid #ddd7ca;background-color:#ffffff;font-size:13px;line-height:1.6;color:#666666;text-align:center;">
-                            생성 시각: {esc(created_at)} | 원본 메일 수: {len(mails)}건 | 검색 기간: 최근 {DEFAULT_LOOKBACK_DAYS}일
+                        <td style="padding:30px 34px 22px 34px;text-align:center;background-color:#f5efe2;border-bottom:4px double #222222;">
+                            <div style="font-size:44px;line-height:1.05;font-weight:700;letter-spacing:1.5px;color:#151515;">{esc(plan.get("paper_title", "GOC DAILY MAIL TIMES"))}</div>
+                            <div style="padding-top:10px;font-size:16px;line-height:1.7;color:#5e584f;">{esc(plan.get("paper_subtitle", "사내 메일 자동 편집 신문"))}</div>
                         </td>
                     </tr>
                     <tr>
-                        <td style="padding:16px 24px;text-align:center;background-color:#faf8f1;border-bottom:1px solid #ddd7ca;font-size:24px;line-height:1.5;font-weight:700;color:#1d1d1d;">
+                        <td style="padding:0 24px;background-color:#fcfaf4;">
+                            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-bottom:1px solid #d8cfbe;">
+                                <tr>
+                                    <td style="padding:12px 8px;font-size:13px;line-height:1.6;color:#6b655b;text-align:left;">생성 시각 {esc(created_at)}</td>
+                                    <td style="padding:12px 8px;font-size:13px;line-height:1.6;color:#6b655b;text-align:center;">원본 메일 {len(mails)}건</td>
+                                    <td style="padding:12px 8px;font-size:13px;line-height:1.6;color:#6b655b;text-align:right;">최근 {DEFAULT_LOOKBACK_DAYS}일 기준</td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding:18px 30px;text-align:center;background-color:#fcfaf4;border-bottom:1px solid #ddd7ca;font-size:22px;line-height:1.6;font-weight:700;color:#1d1d1d;">
                             {esc((top.get("headline") or plan.get("paper_title") or "오늘의 주요 이슈"))}
                         </td>
                     </tr>
                     <tr>
-                        <td style="padding:24px;">
-                            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;border:1px solid #ddd2b8;background-color:#fffdfa;">
+                        <td style="padding:26px 24px 20px 24px;">
+                            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;border:1px solid #d8cfbe;background-color:#fffdf9;">
                                 <tr>
-                                    <td style="padding:24px;">
-                                        <div style="display:inline-block;padding:5px 10px;background-color:#111111;color:#ffffff;font-size:12px;line-height:1.2;font-weight:700;">TOP STORY</div>
-                                        <div style="padding-top:14px;font-size:36px;line-height:1.3;font-weight:700;color:#1d1d1d;">{esc(top.get("headline"))}</div>
-                                        <div style="padding-top:10px;font-size:18px;line-height:1.6;color:#6b6b6b;">{esc_br(top.get("subheadline"))}</div>
-                                        <div style="padding-top:16px;font-size:17px;line-height:1.8;color:#2f2b25;">{esc_br(top.get("summary"))}</div>
+                                    <td style="padding:28px;">
+                                        <div style="display:inline-block;padding:6px 12px;background-color:#161616;color:#ffffff;font-size:12px;line-height:1.2;font-weight:700;letter-spacing:1px;">TOP STORY</div>
+                                        <div style="padding-top:16px;font-size:38px;line-height:1.25;font-weight:700;color:#161616;">{esc(top.get("headline"))}</div>
+                                        <div style="padding-top:10px;font-size:18px;line-height:1.7;color:#71695d;">{esc_br(top.get("subheadline"))}</div>
+                                        <div style="padding-top:18px;font-size:17px;line-height:1.95;color:#2e2a24;">{esc_br(top.get("summary"))}</div>
                                         {top_bullets}
                                         {top_sources}
                                     </td>
@@ -687,21 +813,12 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
                         </td>
                     </tr>
                     <tr>
-                        <td style="padding:0 24px 24px 24px;">
+                        <td style="padding:0 24px 12px 24px;">
                             <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
                                 <tr>
-                                    <td style="padding:16px;border:1px solid #ddd2b8;background-color:#faf6ea;">
-                                        <div style="font-size:18px;line-height:1.4;font-weight:700;color:#1d1d1d;">편집자 노트</div>
-                                        <div style="padding-top:10px;font-size:14px;line-height:1.8;color:#3f3a34;">{esc_br(plan.get("editor_note", ""))}</div>
-                                    </td>
-                                </tr>
-                                <tr>
-                                    <td style="height:12px;font-size:0;line-height:0;">&nbsp;</td>
-                                </tr>
-                                <tr>
-                                    <td style="padding:16px;border:1px solid #ddd2b8;background-color:#faf6ea;">
-                                        <div style="font-size:18px;line-height:1.4;font-weight:700;color:#1d1d1d;">오늘 편집 방향</div>
-                                        <div style="padding-top:10px;font-size:14px;line-height:1.8;color:#3f3a34;">개별 메일 나열이 아니라, 유사 주제를 하나의 기사로 통합해 신문형 레이아웃으로 재편집했습니다.</div>
+                                    <td style="padding:18px 20px;border:1px solid #d8cfbe;background-color:#f7f1e5;">
+                                        <div style="font-size:12px;line-height:1.2;font-weight:700;letter-spacing:1px;color:#8a7b62;text-transform:uppercase;">Editor Note</div>
+                                        <div style="padding-top:10px;font-size:15px;line-height:1.9;color:#3f3a34;">{esc_br(plan.get("editor_note", ""))}</div>
                                     </td>
                                 </tr>
                             </table>
@@ -709,7 +826,7 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
                     </tr>
                     {sections_html}
                     <tr>
-                        <td style="padding:16px 20px;border-top:1px solid #ddd7ca;background-color:#fafafa;text-align:center;font-size:12px;line-height:1.6;color:#777777;">
+                        <td style="padding:18px 20px;border-top:1px solid #ddd7ca;background-color:#f4f1ea;text-align:center;font-size:12px;line-height:1.7;color:#777777;">
                             본 HTML은 사내 메일을 기반으로 자동 생성된 신문형 초안입니다.
                         </td>
                     </tr>
