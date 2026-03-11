@@ -286,6 +286,10 @@ def get_week_label(target_date: Optional[datetime] = None) -> str:
     return f"W{target_date.isocalendar().week}"
 
 
+def get_newsletter_title(target_date: Optional[datetime] = None) -> str:
+    return f"GOC 주간 이슈 ({get_week_label(target_date)})"
+
+
 def html_to_text_basic(html_text: str) -> str:
     if not html_text:
         return ""
@@ -485,7 +489,7 @@ def build_mail_bundle_for_llm(mails: List[MailItem]) -> str:
 def build_fallback_plan(mails: List[MailItem], editor_note: str) -> Dict[str, Any]:
     if not mails:
         return {
-            "paper_title": "오늘의 사내 메일 브리핑",
+            "paper_title": get_newsletter_title(),
             "paper_subtitle": "수집된 메일이 없어 편집본을 생성하지 못했습니다.",
             "top_story": {
                 "headline": "수집된 메일 없음",
@@ -509,7 +513,7 @@ def build_fallback_plan(mails: List[MailItem], editor_note: str) -> Dict[str, An
         })
 
     return {
-        "paper_title": datetime.now().strftime("%Y-%m-%d 사내 메일 브리핑"),
+        "paper_title": get_newsletter_title(),
         "paper_subtitle": f"최근 {DEFAULT_LOOKBACK_DAYS}일 기준 주요 메일 {len(mails)}건 요약",
         "top_story": {
             "headline": top_mail.subject,
@@ -558,7 +562,7 @@ def normalize_plan(data: Dict[str, Any], mails: List[MailItem]) -> Dict[str, Any
             })
 
     return {
-        "paper_title": str(data.get("paper_title") or datetime.now().strftime("%Y-%m-%d 사내 메일 브리핑")).strip(),
+        "paper_title": get_newsletter_title(),
         "paper_subtitle": clean_text(str(data.get("paper_subtitle") or f"최근 {DEFAULT_LOOKBACK_DAYS}일 메일 요약"))[:160],
         "top_story": {
             "headline": str(top.get("headline") or (mails[0].subject if mails else "오늘의 주요 이슈")).strip(),
@@ -963,7 +967,7 @@ def send_generated_news_mail(plan: Dict[str, Any], html_path: str):
     with open(html_path, "r", encoding="utf-8") as f:
         html_contents = f.read()
 
-    subject = f"GOC 주간 이슈 ({get_week_label()})"
+    subject = get_newsletter_title()
 
     return send_mail_api(
         sender_id=MAIL_SENDER_ID,
