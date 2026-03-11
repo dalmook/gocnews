@@ -60,8 +60,10 @@ MAIL_API_CONFIG = {
     "SYSTEM_ID": os.getenv("MAIL_API_SYSTEM_ID", "KCC10REST00621"),
 }
 MAIL_SENDER_ID = os.getenv("MAIL_SENDER_ID", "sungmook.cho").strip()
-MAIL_DEFAULT_RECIPIENTS = [
-    {"emailAddress": "sungmook.cho@samsung.com", "recipientType": "TO"}
+# 수신자는 여기에 아이디만 추가하면 됩니다.
+# 예: ["sungmook.cho", "user2", "user3"]
+MAIL_RECIPIENT_IDS = [
+    "sungmook.cho",
 ]
 CATEGORY_STYLES = {
     "[HBM]": {"label": "HBM", "accent": "#c85c3d", "bg": "#f7e0d6"},
@@ -135,6 +137,20 @@ def call_gpt_oss(prompt: str, system_prompt: Optional[str] = None,
         return resp.json()
     except requests.exceptions.RequestException as e:
         return {"error": str(e)}
+
+
+def build_mail_recipients(recipient_ids: List[str]) -> List[Dict[str, str]]:
+    recipients = []
+    for recipient_id in recipient_ids:
+        recipient_id = (recipient_id or "").strip()
+        if not recipient_id:
+            continue
+        email_address = recipient_id if "@" in recipient_id else f"{recipient_id}@samsung.com"
+        recipients.append({
+            "emailAddress": email_address,
+            "recipientType": "TO"
+        })
+    return recipients
 
 
 def send_mail_api(
@@ -968,6 +984,7 @@ def send_generated_news_mail(plan: Dict[str, Any], html_path: str):
         html_contents = f.read()
 
     subject = get_newsletter_title()
+    recipients = build_mail_recipients(MAIL_RECIPIENT_IDS)
 
     return send_mail_api(
         sender_id=MAIL_SENDER_ID,
@@ -975,7 +992,7 @@ def send_generated_news_mail(plan: Dict[str, Any], html_path: str):
         contents=html_contents,
         content_type="HTML",
         doc_secu_type="PERSONAL",
-        recipients=MAIL_DEFAULT_RECIPIENTS
+        recipients=recipients
     )
 
 
