@@ -31,7 +31,7 @@ import html
 import poplib
 import requests
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from email import policy
 from email.parser import BytesParser
 from email.header import decode_header, make_header
@@ -50,6 +50,9 @@ CREDENTIAL_KEY = os.getenv("LLM_CREDENTIAL_KEY", "").strip()
 USER_ID = os.getenv("LLM_USER_ID", "sungmook.cho").strip()
 USER_TYPE = os.getenv("LLM_USER_TYPE", "AD_ID").strip()
 SEND_SYSTEM_NAME = os.getenv("LLM_SEND_SYSTEM_NAME", "GOC_MAIL_RAG_PIPELINE").strip()
+EXCLUDE_KEYWORDS = ["[공통]", "[공급망운영 그룹]", "EDP 파트 주요 이슈"]
+DEFAULT_LOOKBACK_DAYS = 7
+FILTER_KEYWORDS = ["[HBM]", "[FLASH]", "[물류]", "[MOBILE]", "[EDP]", "[DO]", "[운영관리]", "[운영기획]"]
 
 
 # =========================================================
@@ -60,6 +63,7 @@ class MailQueryParams:
     user: str
     password: str
     max_count: int = 12
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS
 
 
 @dataclass
@@ -193,6 +197,39 @@ def trim_mail_body(text: str, max_len: int = 1800) -> str:
     return text
 
 
+def normalize_compact(text: str) -> str:
+    return re.sub(r"\s+", "", text or "").lower()
+
+
+def contains_any_keyword(text: str, keywords: List[str], ignore_spaces: bool = False) -> bool:
+    if not text:
+        return False
+    target = normalize_compact(text) if ignore_spaces else text.lower()
+    for keyword in keywords:
+        candidate = normalize_compact(keyword) if ignore_spaces else keyword.lower()
+        if candidate and candidate in target:
+            return True
+    return False
+
+
+def should_include_mail(subject: str, body: str, date_obj: Optional[datetime], cutoff: datetime) -> bool:
+    if date_obj is not None:
+        if date_obj.tzinfo is not None:
+            cutoff_cmp = cutoff.replace(tzinfo=date_obj.tzinfo)
+        else:
+            cutoff_cmp = cutoff
+        if date_obj < cutoff_cmp:
+            return False
+
+    if contains_any_keyword(subject, FILTER_KEYWORDS, ignore_spaces=True) is False:
+        return False
+
+    if contains_any_keyword(subject, EXCLUDE_KEYWORDS) or contains_any_keyword(body, EXCLUDE_KEYWORDS):
+        return False
+
+    return True
+
+
 def extract_body_from_message(msg) -> str:
     plain_parts = []
     html_parts = []
@@ -247,12 +284,12 @@ def extract_body_from_message(msg) -> str:
 def fetch_recent_mails(params: MailQueryParams) -> List[MailItem]:
     client = _pop3_connect(params)
     items: List[MailItem] = []
+    cutoff = datetime.now() - timedelta(days=params.lookback_days)
 
     try:
         count, _ = client.stat()
-        start_idx = max(1, count - params.max_count + 1)
 
-        for i in range(count, start_idx - 1, -1):
+        for i in range(count, 0, -1):
             _, lines, _ = client.retr(i)
             raw_email = b"\n".join(lines)
             msg = BytesParser(policy=policy.default).parsebytes(raw_email)
@@ -269,6 +306,8 @@ def fetch_recent_mails(params: MailQueryParams) -> List[MailItem]:
             body = extract_body_from_message(msg)
             if not body and not subject:
                 continue
+            if not should_include_mail(subject, body, date_obj, cutoff):
+                continue
 
             items.append(MailItem(
                 subject=subject or "(제목 없음)",
@@ -277,6 +316,8 @@ def fetch_recent_mails(params: MailQueryParams) -> List[MailItem]:
                 date_obj=date_obj,
                 body=body
             ))
+            if len(items) >= params.max_count:
+                break
     finally:
         try:
             client.quit()
@@ -432,6 +473,10 @@ def esc(v) -> str:
     return html.escape(str(v or ""))
 
 
+def esc_br(v) -> str:
+    return esc(v).replace("\n", "<br>")
+
+
 def render_related_sources(indexes: List[int], mails: List[MailItem]) -> str:
     if not indexes:
         return ""
@@ -441,26 +486,59 @@ def render_related_sources(indexes: List[int], mails: List[MailItem]) -> str:
             m = mails[idx - 1]
             dt = m.date_obj.strftime("%Y-%m-%d %H:%M") if m.date_obj else m.date_str
             rows.append(
-                f"<li><strong>[메일 {idx}]</strong> {esc(m.subject)}"
-                f"<br><span>{esc(m.sender)} · {esc(dt)}</span></li>"
+                "<tr>"
+                "<td style=\"padding:0 0 10px 0;font-size:13px;line-height:1.6;color:#5f5a50;\">"
+                f"<strong>[메일 {idx}]</strong> {esc(m.subject)}"
+                f"<br><span>{esc(m.sender)} | {esc(dt)}</span>"
+                "</td>"
+                "</tr>"
             )
     if not rows:
         return ""
-    return f"<ul class='source-list'>{''.join(rows)}</ul>"
+    return (
+        "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" "
+        "style=\"margin-top:12px;border-top:1px solid #ddd2b8;padding-top:12px;\">"
+        f"{''.join(rows)}</table>"
+    )
+
+
+def render_bullet_block(items: List[str], limit: int) -> str:
+    rows = []
+    for item in (items or [])[:limit]:
+        rows.append(
+            "<tr>"
+            "<td valign=\"top\" style=\"padding:0 8px 8px 0;font-size:15px;line-height:1.7;color:#1d1d1d;\">-</td>"
+            f"<td style=\"padding:0 0 8px 0;font-size:15px;line-height:1.7;color:#1d1d1d;\">{esc_br(item)}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return ""
+    return (
+        "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" "
+        "style=\"margin-top:12px;\">"
+        f"{''.join(rows)}</table>"
+    )
 
 
 def render_article_card(article: Dict[str, Any], mails: List[MailItem]) -> str:
-    bullets = article.get("bullets", []) or []
-    bullets_html = "".join(f"<li>{esc(b)}</li>" for b in bullets[:4])
+    bullets_html = render_bullet_block(article.get("bullets", []) or [], 4)
     source_html = render_related_sources(article.get("related_mail_indexes", []), mails)
 
     return f"""
-    <article class="article-card">
-        <h4>{esc(article.get("headline"))}</h4>
-        <p class="article-summary">{esc(article.get("summary"))}</p>
-        {'<ul class="bullet-list">' + bullets_html + '</ul>' if bullets_html else ''}
-        {source_html}
-    </article>
+    <tr>
+        <td style="padding:0 0 16px 0;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #d9d2c1;background:#ffffff;">
+                <tr>
+                    <td style="padding:18px 20px 20px 20px;">
+                        <div style="font-size:24px;line-height:1.4;font-weight:700;color:#1d1d1d;">{esc(article.get("headline"))}</div>
+                        <div style="padding-top:10px;font-size:15px;line-height:1.8;color:#2f2b25;">{esc_br(article.get("summary"))}</div>
+                        {bullets_html}
+                        {source_html}
+                    </td>
+                </tr>
+            </table>
+        </td>
+    </tr>
     """
 
 
@@ -468,19 +546,25 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
     created_at = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     top = plan.get("top_story", {}) or {}
-    top_bullets = "".join(f"<li>{esc(b)}</li>" for b in (top.get("bullets") or [])[:5])
+    top_bullets = render_bullet_block(top.get("bullets") or [], 5)
     top_sources = render_related_sources(top.get("related_mail_indexes", []), mails)
 
     sections_html = ""
     for sec in plan.get("sections", []) or []:
         articles_html = "".join(render_article_card(a, mails) for a in (sec.get("articles") or []))
         sections_html += f"""
-        <section class="section-block">
-            <div class="section-title">{esc(sec.get("section_name"))}</div>
-            <div class="section-grid">
-                {articles_html}
-            </div>
-        </section>
+        <tr>
+            <td style="padding:0 24px 24px 24px;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:3px solid #222222;">
+                    <tr>
+                        <td style="padding:14px 0 16px 0;font-size:22px;line-height:1.3;font-weight:700;color:#1d1d1d;">
+                            {esc(sec.get("section_name"))}
+                        </td>
+                    </tr>
+                    {articles_html}
+                </table>
+            </td>
+        </tr>
         """
 
     html_text = f"""
@@ -488,224 +572,76 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
 <html lang="ko">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{esc(plan.get("paper_title", "사내 메일 신문"))}</title>
-<style>
-    body {{
-        margin: 0;
-        background: #efe9dc;
-        color: #1d1d1d;
-        font-family: "Malgun Gothic", "Apple SD Gothic Neo", Arial, sans-serif;
-    }}
-    .page {{
-        max-width: 1280px;
-        margin: 20px auto;
-        background: #fffdf8;
-        border: 1px solid #d4cdbf;
-        box-shadow: 0 6px 24px rgba(0,0,0,0.08);
-    }}
-    .masthead {{
-        padding: 24px 30px 18px;
-        border-bottom: 4px double #222;
-        text-align: center;
-        background: #fbf6ea;
-    }}
-    .masthead h1 {{
-        margin: 0;
-        font-size: 42px;
-        letter-spacing: 2px;
-    }}
-    .masthead .subtitle {{
-        margin-top: 8px;
-        font-size: 15px;
-        color: #666;
-    }}
-    .topbar {{
-        display: flex;
-        justify-content: space-between;
-        gap: 12px;
-        padding: 10px 20px;
-        border-bottom: 1px solid #ddd;
-        background: #fff;
-        font-size: 13px;
-        color: #666;
-    }}
-    .lead-banner {{
-        padding: 16px 24px;
-        text-align: center;
-        font-size: 24px;
-        font-weight: 700;
-        border-bottom: 1px solid #ddd;
-        background: #faf8f1;
-    }}
-    .main-grid {{
-        display: grid;
-        grid-template-columns: 2.1fr 1fr;
-        gap: 0;
-    }}
-    .hero {{
-        padding: 28px;
-        border-right: 1px solid #ddd;
-    }}
-    .hero-label {{
-        display: inline-block;
-        padding: 5px 10px;
-        background: #111;
-        color: white;
-        font-size: 12px;
-        margin-bottom: 12px;
-    }}
-    .hero h2 {{
-        margin: 0 0 10px;
-        font-size: 36px;
-        line-height: 1.3;
-    }}
-    .hero h3 {{
-        margin: 0 0 14px;
-        font-size: 18px;
-        line-height: 1.5;
-        color: #6b6b6b;
-        font-weight: normal;
-    }}
-    .hero-summary {{
-        font-size: 17px;
-        line-height: 1.8;
-        margin-bottom: 16px;
-    }}
-    .bullet-list {{
-        margin: 0 0 18px 18px;
-        line-height: 1.7;
-    }}
-    .side-note {{
-        padding: 24px;
-        background: #fffdfa;
-    }}
-    .editor-box {{
-        border: 1px solid #ddd2b8;
-        background: #faf6ea;
-        padding: 16px;
-        margin-bottom: 18px;
-    }}
-    .editor-box h4 {{
-        margin: 0 0 10px;
-        font-size: 18px;
-    }}
-    .source-list {{
-        margin: 12px 0 0 18px;
-        color: #666;
-        line-height: 1.6;
-        font-size: 13px;
-    }}
-    .source-list li {{
-        margin-bottom: 8px;
-    }}
-    .sections {{
-        padding: 0 24px 24px;
-    }}
-    .section-block {{
-        margin-top: 24px;
-        border-top: 3px solid #222;
-        padding-top: 14px;
-    }}
-    .section-title {{
-        font-size: 22px;
-        font-weight: 700;
-        margin-bottom: 16px;
-    }}
-    .section-grid {{
-        display: grid;
-        grid-template-columns: 1fr 1fr;
-        gap: 16px;
-    }}
-    .article-card {{
-        border: 1px solid #ddd;
-        background: #fff;
-        padding: 18px;
-    }}
-    .article-card h4 {{
-        margin: 0 0 10px;
-        font-size: 23px;
-        line-height: 1.4;
-    }}
-    .article-summary {{
-        margin: 0 0 10px;
-        font-size: 15px;
-        line-height: 1.75;
-    }}
-    .footer {{
-        border-top: 1px solid #ddd;
-        padding: 16px 20px;
-        text-align: center;
-        color: #777;
-        font-size: 12px;
-        background: #fafafa;
-    }}
-    @media (max-width: 960px) {{
-        .main-grid {{
-            grid-template-columns: 1fr;
-        }}
-        .hero {{
-            border-right: none;
-            border-bottom: 1px solid #ddd;
-        }}
-        .section-grid {{
-            grid-template-columns: 1fr;
-        }}
-        .masthead h1 {{
-            font-size: 30px;
-        }}
-        .hero h2 {{
-            font-size: 28px;
-        }}
-    }}
-</style>
 </head>
-<body>
-    <div class="page">
-        <header class="masthead">
-            <h1>{esc(plan.get("paper_title", "GOC DAILY MAIL TIMES"))}</h1>
-            <div class="subtitle">{esc(plan.get("paper_subtitle", "사내 메일 자동 편집 신문"))}</div>
-        </header>
-
-        <div class="topbar">
-            <div>생성 시각: {esc(created_at)}</div>
-            <div>원본 메일 수: {len(mails)}건</div>
-        </div>
-
-        <div class="lead-banner">
-            {esc((top.get("headline") or plan.get("paper_title") or "오늘의 주요 이슈"))}
-        </div>
-
-        <div class="main-grid">
-            <section class="hero">
-                <div class="hero-label">TOP STORY</div>
-                <h2>{esc(top.get("headline"))}</h2>
-                <h3>{esc(top.get("subheadline"))}</h3>
-                <p class="hero-summary">{esc(top.get("summary"))}</p>
-                {'<ul class="bullet-list">' + top_bullets + '</ul>' if top_bullets else ''}
-                {top_sources}
-            </section>
-
-            <aside class="side-note">
-                <div class="editor-box">
-                    <h4>편집자 노트</h4>
-                    <p>{esc(plan.get("editor_note", ""))}</p>
-                </div>
-                <div class="editor-box">
-                    <h4>오늘 편집 방향</h4>
-                    <p>개별 메일 나열이 아니라, 유사 주제를 하나의 기사로 통합해 신문형 레이아웃으로 재편집했습니다.</p>
-                </div>
-            </aside>
-        </div>
-
-        <div class="sections">
-            {sections_html}
-        </div>
-
-        <footer class="footer">
-            본 HTML은 사내 메일을 기반으로 자동 생성된 신문형 초안입니다.
-        </footer>
-    </div>
+<body style="margin:0;padding:0;background-color:#efe9dc;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;margin:0;padding:24px 0;background-color:#efe9dc;">
+        <tr>
+            <td align="center">
+                <table role="presentation" width="760" cellpadding="0" cellspacing="0" style="width:760px;max-width:760px;background-color:#fffdf8;border:1px solid #d4cdbf;font-family:'Malgun Gothic','Apple SD Gothic Neo',Arial,sans-serif;color:#1d1d1d;">
+                    <tr>
+                        <td style="padding:28px 30px 18px 30px;text-align:center;background-color:#fbf6ea;border-bottom:4px double #222222;">
+                            <div style="font-size:42px;line-height:1.1;font-weight:700;letter-spacing:2px;">{esc(plan.get("paper_title", "GOC DAILY MAIL TIMES"))}</div>
+                            <div style="padding-top:8px;font-size:15px;line-height:1.5;color:#666666;">{esc(plan.get("paper_subtitle", "사내 메일 자동 편집 신문"))}</div>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding:10px 20px;border-bottom:1px solid #ddd7ca;background-color:#ffffff;font-size:13px;line-height:1.6;color:#666666;text-align:center;">
+                            생성 시각: {esc(created_at)} | 원본 메일 수: {len(mails)}건 | 검색 기간: 최근 {DEFAULT_LOOKBACK_DAYS}일
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding:16px 24px;text-align:center;background-color:#faf8f1;border-bottom:1px solid #ddd7ca;font-size:24px;line-height:1.5;font-weight:700;color:#1d1d1d;">
+                            {esc((top.get("headline") or plan.get("paper_title") or "오늘의 주요 이슈"))}
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding:24px;">
+                            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;border:1px solid #ddd2b8;background-color:#fffdfa;">
+                                <tr>
+                                    <td style="padding:24px;">
+                                        <div style="display:inline-block;padding:5px 10px;background-color:#111111;color:#ffffff;font-size:12px;line-height:1.2;font-weight:700;">TOP STORY</div>
+                                        <div style="padding-top:14px;font-size:36px;line-height:1.3;font-weight:700;color:#1d1d1d;">{esc(top.get("headline"))}</div>
+                                        <div style="padding-top:10px;font-size:18px;line-height:1.6;color:#6b6b6b;">{esc_br(top.get("subheadline"))}</div>
+                                        <div style="padding-top:16px;font-size:17px;line-height:1.8;color:#2f2b25;">{esc_br(top.get("summary"))}</div>
+                                        {top_bullets}
+                                        {top_sources}
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding:0 24px 24px 24px;">
+                            <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+                                <tr>
+                                    <td style="padding:16px;border:1px solid #ddd2b8;background-color:#faf6ea;">
+                                        <div style="font-size:18px;line-height:1.4;font-weight:700;color:#1d1d1d;">편집자 노트</div>
+                                        <div style="padding-top:10px;font-size:14px;line-height:1.8;color:#3f3a34;">{esc_br(plan.get("editor_note", ""))}</div>
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <td style="height:12px;font-size:0;line-height:0;">&nbsp;</td>
+                                </tr>
+                                <tr>
+                                    <td style="padding:16px;border:1px solid #ddd2b8;background-color:#faf6ea;">
+                                        <div style="font-size:18px;line-height:1.4;font-weight:700;color:#1d1d1d;">오늘 편집 방향</div>
+                                        <div style="padding-top:10px;font-size:14px;line-height:1.8;color:#3f3a34;">개별 메일 나열이 아니라, 유사 주제를 하나의 기사로 통합해 신문형 레이아웃으로 재편집했습니다.</div>
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                    {sections_html}
+                    <tr>
+                        <td style="padding:16px 20px;border-top:1px solid #ddd7ca;background-color:#fafafa;text-align:center;font-size:12px;line-height:1.6;color:#777777;">
+                            본 HTML은 사내 메일을 기반으로 자동 생성된 신문형 초안입니다.
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+    </table>
 </body>
 </html>
 """
@@ -728,7 +664,8 @@ def main():
     params = MailQueryParams(
         user=user,
         password=password,
-        max_count=10
+        max_count=10,
+        lookback_days=DEFAULT_LOOKBACK_DAYS
     )
 
     print("[1] 최근 메일 수집 중...")
