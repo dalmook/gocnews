@@ -77,6 +77,17 @@ CATEGORY_STYLES = {
     "기타": {"label": "기타", "accent": "#666666", "bg": "#ebebeb"},
 }
 ISSUE_LINK_URL = "https://go/issueG"
+STRUCTURAL_LINE_PATTERNS = [
+    r"(?im)^\s*lv\s*\d+\s*:\s*.*$",
+    r"(?im)^\s*level\s*\d+\s*:\s*.*$",
+    r"(?im)^\s*(관리항목|관리 항목|실행조직|실행 조직|구분|분류|담당|담당자)\s*[:\-]\s*.*$",
+    r"(?im)^\s*(sender|from|date|title|subject|sent|to|cc)\s*:\s*.*$",
+]
+IMPORTANT_SENTENCE_HINTS = [
+    "이슈", "리스크", "위험", "문제", "불량", "지연", "영향", "원인", "대응", "조치",
+    "요청", "필요", "완료", "예정", "계획", "진행", "확인", "공유", "부족", "증가",
+    "감소", "수율", "출하", "납기", "재고", "생산", "양산", "변경", "차질",
+]
 
 
 # =========================================================
@@ -285,8 +296,60 @@ def clean_text(text: str) -> str:
     return text.strip()
 
 
+def remove_structural_lines(text: str) -> str:
+    if not text:
+        return ""
+    cleaned = text
+    for pattern in STRUCTURAL_LINE_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*[-=]{3,}\s*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*[■□▶▷]+[\s:：-]*$", "", cleaned)
+    return clean_text(cleaned)
+
+
+def split_sentences(text: str) -> List[str]:
+    if not text:
+        return []
+    normalized = re.sub(r"\n+", " ", text)
+    parts = re.split(r"(?<=[.!?。]|다\.)\s+|(?<=\.)\s+|(?<=\?)\s+|(?<=!)\s+", normalized)
+    return [clean_text(part) for part in parts if clean_text(part)]
+
+
+def score_sentence(sentence: str) -> int:
+    score = 0
+    if re.search(r"\d", sentence):
+        score += 2
+    if re.search(r"\b\d{1,2}/\d{1,2}\b|\b\d{4}-\d{2}-\d{2}\b", sentence):
+        score += 2
+    for hint in IMPORTANT_SENTENCE_HINTS:
+        if hint in sentence:
+            score += 3
+    if len(sentence) < 12:
+        score -= 2
+    if re.search(r"(?i)\b(lv|level)\s*\d+\b", sentence):
+        score -= 5
+    return score
+
+
+def extract_important_summary_text(text: str, max_sentences: int = 3) -> str:
+    cleaned = remove_structural_lines(text)
+    sentences = split_sentences(cleaned)
+    if not sentences:
+        return ""
+
+    scored = [(idx, sentence, score_sentence(sentence)) for idx, sentence in enumerate(sentences)]
+    important = [item for item in scored if item[2] > 0]
+    if not important:
+        important = scored[:max_sentences]
+    else:
+        important = sorted(important, key=lambda item: (-item[2], item[0]))[:max_sentences]
+        important = sorted(important, key=lambda item: item[0])
+
+    return clean_text(" ".join(sentence for _, sentence, _ in important))
+
+
 def summarize_text(text: str, max_length: int = 180) -> str:
-    text = clean_text(text)
+    text = extract_important_summary_text(text) or remove_structural_lines(text) or clean_text(text)
     if len(text) <= max_length:
         return text
     clipped = text[:max_length]
