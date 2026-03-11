@@ -74,6 +74,7 @@ CATEGORY_STYLES = {
     "[운영기획]": {"label": "운영기획", "accent": "#8f7d29", "bg": "#f3efcd"},
     "기타": {"label": "기타", "accent": "#666666", "bg": "#ebebeb"},
 }
+ISSUE_LINK_URL = "https://go/issueG"
 
 
 # =========================================================
@@ -277,6 +278,12 @@ def summarize_text(text: str, max_length: int = 180) -> str:
     if last_stop >= int(max_length * 0.55):
         return clipped[:last_stop + 1]
     return clipped.rstrip() + "..."
+
+
+def get_week_label(target_date: Optional[datetime] = None) -> str:
+    if target_date is None:
+        target_date = datetime.now()
+    return f"W{target_date.isocalendar().week}"
 
 
 def html_to_text_basic(html_text: str) -> str:
@@ -767,9 +774,8 @@ def render_detail_table(mails: List[MailItem]) -> str:
             rows.append(
                 "<tr>"
                 f"<td style=\"padding:12px 10px;border-bottom:1px solid #e6dece;font-size:13px;line-height:1.6;color:#5e584f;vertical-align:top;white-space:nowrap;\">{esc(date_str)}</td>"
-                f"<td style=\"padding:12px 10px;border-bottom:1px solid #e6dece;font-size:13px;line-height:1.7;color:#2f2b25;vertical-align:top;font-weight:700;\">{esc(mail.sender)}</td>"
                 f"<td style=\"padding:12px 10px;border-bottom:1px solid #e6dece;font-size:14px;line-height:1.7;color:#191919;vertical-align:top;font-weight:700;\">{esc(mail.subject)}</td>"
-                f"<td style=\"padding:12px 10px;border-bottom:1px solid #e6dece;font-size:14px;line-height:1.8;color:#44403a;vertical-align:top;\">{esc_br(summarize_text(mail.body, 220))}</td>"
+                f"<td style=\"padding:12px 10px;border-bottom:1px solid #e6dece;font-size:13px;line-height:1.7;color:#2f2b25;vertical-align:top;font-weight:700;\">{esc(mail.sender)}</td>"
                 "</tr>"
             )
 
@@ -787,9 +793,8 @@ def render_detail_table(mails: List[MailItem]) -> str:
             "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:100%;\">"
             "<tr>"
             "<td style=\"padding:12px 10px;border-bottom:2px solid #cfc4af;font-size:12px;line-height:1.4;color:#7a7266;font-weight:700;\">DATE</td>"
-            "<td style=\"padding:12px 10px;border-bottom:2px solid #cfc4af;font-size:12px;line-height:1.4;color:#7a7266;font-weight:700;\">SENDER</td>"
             "<td style=\"padding:12px 10px;border-bottom:2px solid #cfc4af;font-size:12px;line-height:1.4;color:#7a7266;font-weight:700;\">SUBJECT</td>"
-            "<td style=\"padding:12px 10px;border-bottom:2px solid #cfc4af;font-size:12px;line-height:1.4;color:#7a7266;font-weight:700;\">SUMMARY</td>"
+            "<td style=\"padding:12px 10px;border-bottom:2px solid #cfc4af;font-size:12px;line-height:1.4;color:#7a7266;font-weight:700;\">SENDER</td>"
             "</tr>"
             f"{''.join(rows)}"
             "</table>"
@@ -876,6 +881,9 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
                         <td style="padding:30px 34px 22px 34px;text-align:center;background-color:#f5efe2;border-bottom:4px double #222222;">
                             <div style="font-size:44px;line-height:1.05;font-weight:700;letter-spacing:1.5px;color:#151515;">{esc(plan.get("paper_title", "GOC DAILY MAIL TIMES"))}</div>
                             <div style="padding-top:10px;font-size:16px;line-height:1.7;color:#5e584f;">{esc(plan.get("paper_subtitle", "사내 메일 자동 편집 신문"))}</div>
+                            <div style="padding-top:16px;">
+                                <a href="{esc(ISSUE_LINK_URL)}" style="display:inline-block;padding:10px 18px;background-color:#1a1a1a;color:#f8f3e8;text-decoration:none;font-size:13px;line-height:1.2;font-weight:700;letter-spacing:0.4px;border-radius:2px;">이슈지 바로가기</a>
+                            </div>
                         </td>
                     </tr>
                     <tr>
@@ -955,9 +963,7 @@ def send_generated_news_mail(plan: Dict[str, Any], html_path: str):
     with open(html_path, "r", encoding="utf-8") as f:
         html_contents = f.read()
 
-    subject = plan.get("paper_title") or "GOC DAILY MAIL TIMES"
-    if not subject.startswith("[GOC NEWS]"):
-        subject = f"[GOC NEWS] {subject}"
+    subject = f"GOC 주간 이슈 ({get_week_label()})"
 
     return send_mail_api(
         sender_id=MAIL_SENDER_ID,
