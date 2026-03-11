@@ -86,7 +86,7 @@ ISSUE_LINK_URL = "https://go/issueG"
 class MailQueryParams:
     user: str
     password: str
-    max_count: int = 12
+    max_count: Optional[int] = None
     lookback_days: int = DEFAULT_LOOKBACK_DAYS
 
 
@@ -472,7 +472,7 @@ def fetch_recent_mails(params: MailQueryParams) -> List[MailItem]:
                 date_obj=date_obj,
                 body=body
             ))
-            if len(items) >= params.max_count:
+            if params.max_count is not None and len(items) >= params.max_count:
                 break
     finally:
         try:
@@ -490,13 +490,14 @@ def build_mail_bundle_for_llm(mails: List[MailItem]) -> str:
     blocks = []
     for idx, m in enumerate(mails, start=1):
         dt = m.date_obj.strftime("%Y-%m-%d %H:%M") if m.date_obj else m.date_str
+        compact_summary = summarize_text(m.body, 320)
         block = f"""
 [메일 {idx}]
 제목: {m.subject}
 발신자: {m.sender}
 일시: {dt}
-본문:
-{m.body}
+본문 요약:
+{compact_summary}
 """
         blocks.append(block.strip())
     return "\n\n".join(blocks)
@@ -694,7 +695,9 @@ def generate_newspaper_plan(mails: List[MailItem]) -> Dict[str, Any]:
 """
 
     user_prompt = f"""
-아래 메일 묶음을 읽고, 오늘의 사내 신문 편집본 JSON을 생성하세요.
+아래 메일 묶음은 최근 {DEFAULT_LOOKBACK_DAYS}일 동안 수집된 전체 메일 {len(mails)}건입니다.
+모든 메일을 빠짐없이 훑고, 반복되는 주제는 합치되 특정 카테고리나 후반부 메일이 누락되지 않게 편집하세요.
+오늘의 사내 신문 편집본 JSON을 생성하세요.
 
 {bundle}
 """
@@ -1011,7 +1014,7 @@ def main():
     params = MailQueryParams(
         user=user,
         password=password,
-        max_count=10,
+        max_count=None,
         lookback_days=DEFAULT_LOOKBACK_DAYS
     )
 
