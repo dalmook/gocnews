@@ -311,7 +311,9 @@ def split_sentences(text: str) -> List[str]:
     if not text:
         return []
     normalized = re.sub(r"\n+", " ", text)
-    parts = re.split(r"(?<=[.!?。]|다\.)\s+|(?<=\.)\s+|(?<=\?)\s+|(?<=!)\s+", normalized)
+    normalized = re.sub(r"([.!?。])\s+", r"\1\n", normalized)
+    normalized = re.sub(r"(다\.)\s+", r"\1\n", normalized)
+    parts = normalized.split("\n")
     return [clean_text(part) for part in parts if clean_text(part)]
 
 
