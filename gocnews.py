@@ -665,6 +665,19 @@ def ensure_category_coverage(plan: Dict[str, Any], mails: List[MailItem]) -> Dic
     return plan
 
 
+def clean_subject_for_title(subject: str) -> str:
+    title = clean_text(subject)
+    while True:
+        updated = re.sub(r"(?i)^\s*(?:fw|fwd|re)\s*:\s*", "", title)
+        updated = re.sub(r"(?i)^\s*\(\d+\)\s*", "", updated)
+        updated = re.sub(r"^\s*\[[^\]]+\]\s*", "", updated)
+        updated = clean_text(updated)
+        if updated == title:
+            break
+        title = updated
+    return title
+
+
 def contains_english_title(text: str) -> bool:
     if not text:
         return False
@@ -673,30 +686,37 @@ def contains_english_title(text: str) -> bool:
     return latin_count > 0 and latin_count >= korean_count
 
 
-def build_korean_fallback_headline(related_indexes: List[int], mails: List[MailItem]) -> str:
+def build_balanced_headline(related_indexes: List[int], mails: List[MailItem]) -> str:
     for idx in related_indexes or []:
         if 1 <= idx <= len(mails):
-            subject = mails[idx - 1].subject
-            subject = re.sub(r"\[[^\]]+\]\s*", "", subject).strip()
+            subject = clean_subject_for_title(mails[idx - 1].subject)
             if subject:
+                if contains_english_title(subject):
+                    english_terms = re.findall(r"[A-Za-z0-9][A-Za-z0-9+._/-]*", subject)
+                    if english_terms:
+                        return f"{' '.join(english_terms[:4])} 관련 이슈"
                 return subject
     return "주요 이슈"
 
 
 def localize_plan_titles(plan: Dict[str, Any], mails: List[MailItem]) -> Dict[str, Any]:
     top_story = plan.get("top_story") or {}
+    top_story["headline"] = clean_subject_for_title(top_story.get("headline", ""))
+    top_story["subheadline"] = clean_subject_for_title(top_story.get("subheadline", ""))
     if contains_english_title(top_story.get("headline", "")):
-        top_story["headline"] = build_korean_fallback_headline(top_story.get("related_mail_indexes", []), mails)
+        top_story["headline"] = build_balanced_headline(top_story.get("related_mail_indexes", []), mails)
     if contains_english_title(top_story.get("subheadline", "")):
         top_story["subheadline"] = ""
     plan["top_story"] = top_story
 
     for sec in plan.get("sections", []) or []:
+        sec["section_name"] = clean_subject_for_title(sec.get("section_name", ""))
         if contains_english_title(sec.get("section_name", "")):
             sec["section_name"] = "주요 기사"
         for article in sec.get("articles", []) or []:
+            article["headline"] = clean_subject_for_title(article.get("headline", ""))
             if contains_english_title(article.get("headline", "")):
-                article["headline"] = build_korean_fallback_headline(article.get("related_mail_indexes", []), mails)
+                article["headline"] = build_balanced_headline(article.get("related_mail_indexes", []), mails)
     return plan
 
 
@@ -845,8 +865,12 @@ def generate_newspaper_plan(mails: List[MailItem]) -> Dict[str, Any]:
 - 없는 내용 지어내지 말 것
 - 모든 문자열은 JSON 규칙에 맞게 큰따옴표 내부에만 작성
 - JSON 바깥 텍스트 절대 출력 금지
-- 기사 headline, subheadline, section_name은 가능하면 자연스러운 한국어 제목으로 작성
+- 기사 headline, subheadline, section_name은 자연스럽고 읽기 쉬운 제목으로 작성
+- FW:, RE:, RE:(5) 같은 메일 접두어는 제목에 절대 포함하지 말 것
+- 제목은 메일 원문 제목을 그대로 복사하지 말고, 핵심만 정리한 신문형 제목으로 다듬을 것
+- 어색한 직역체 표현(예: 차기 위험 발생) 금지, 자연스러운 업무 보고 문장으로 정리
 - 단, 메일 본문에 포함된 제품명, 시스템명, 약어, 기술용어의 영어 표기는 임의로 번역하지 말고 원문을 유지
+- 제목에서도 AWS, HBM, EDP 같은 약어/제품명은 원문 유지 가능
 - summary와 bullets에서도 원문 영어 용어를 억지로 한글화하지 말 것
 """
 
