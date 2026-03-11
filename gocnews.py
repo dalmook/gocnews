@@ -28,6 +28,7 @@ import re
 import json
 import uuid
 import html
+import mimetypes
 import poplib
 import requests
 from dataclasses import dataclass
@@ -53,6 +54,15 @@ SEND_SYSTEM_NAME = os.getenv("LLM_SEND_SYSTEM_NAME", "GOC_MAIL_RAG_PIPELINE").st
 EXCLUDE_KEYWORDS = ["[공통]", "[공급망운영 그룹]", "EDP 파트 주요 이슈"]
 DEFAULT_LOOKBACK_DAYS = 7
 FILTER_KEYWORDS = ["[HBM]", "[FLASH]", "[물류]", "[MOBILE]", "[EDP]", "[DO]", "[운영관리]", "[운영기획]"]
+MAIL_API_CONFIG = {
+    "HOST": os.getenv("MAIL_API_HOST", "https://openapi.samsung.net"),
+    "TOKEN": os.getenv("MAIL_API_TOKEN", "Bearer 931e0fcb-31b8-33cf-8699-0d0ef752c85b"),
+    "SYSTEM_ID": os.getenv("MAIL_API_SYSTEM_ID", "KCC10REST00621"),
+}
+MAIL_SENDER_ID = os.getenv("MAIL_SENDER_ID", "sungmook.cho").strip()
+MAIL_DEFAULT_RECIPIENTS = [
+    {"emailAddress": "sungmook.cho@samsung.com"}
+]
 
 
 # =========================================================
@@ -113,6 +123,71 @@ def call_gpt_oss(prompt: str, system_prompt: Optional[str] = None,
         return resp.json()
     except requests.exceptions.RequestException as e:
         return {"error": str(e)}
+
+
+def send_mail_api(
+    *, sender_id: str, subject: str, contents: str,
+    content_type: str = "HTML", doc_secu_type: str = "PERSONAL",
+    recipients: Optional[List[Dict[str, str]]] = None,
+    reserved_time: Optional[str] = None,
+    attachments: Optional[List[str]] = None,
+    proxies: Optional[Dict[str, str]] = None,
+    verify_ssl: bool = False, timeout: int = 30,
+) -> Dict[str, Any]:
+    headers_common = {
+        "Authorization": MAIL_API_CONFIG["TOKEN"],
+        "System-ID": MAIL_API_CONFIG["SYSTEM_ID"],
+    }
+    mail_json: Dict[str, Any] = {
+        "subject": subject,
+        "contents": contents,
+        "contentType": content_type,
+        "docSecuType": doc_secu_type,
+        "sender": {"emailAddress": f"{sender_id}@samsung.com"},
+        "recipients": recipients or [],
+    }
+    if reserved_time:
+        mail_json["reservedTime"] = reserved_time
+
+    url = f'{MAIL_API_CONFIG["HOST"].rstrip("/")}/mail/api/v2.0/mails/send?userId={sender_id}'
+    session = requests.Session()
+    if proxies:
+        session.proxies.update(proxies)
+
+    attach_list = attachments or []
+    if not attach_list:
+        headers = dict(headers_common)
+        headers["Content-Type"] = "application/json"
+        response = session.post(
+            url,
+            data=json.dumps(mail_json, ensure_ascii=False),
+            headers=headers,
+            verify=verify_ssl,
+            timeout=timeout
+        )
+    else:
+        files = [("mail", (None, json.dumps(mail_json, ensure_ascii=False), "application/json"))]
+        for path in attach_list:
+            filename = os.path.basename(path)
+            content_type_guess = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            files.append(("attachments", (filename, open(path, "rb"), content_type_guess)))
+        try:
+            response = session.post(
+                url,
+                headers=headers_common,
+                files=files,
+                verify=verify_ssl,
+                timeout=timeout
+            )
+        finally:
+            for _, file_tuple in files[1:]:
+                try:
+                    file_tuple[1].close()
+                except Exception:
+                    pass
+
+    response.raise_for_status()
+    return response.json() if (response.text or "").strip() else {"ok": True}
 
 
 def extract_json_block(text: str) -> str:
@@ -649,6 +724,24 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
         f.write(html_text)
 
 
+def send_generated_news_mail(plan: Dict[str, Any], html_path: str):
+    with open(html_path, "r", encoding="utf-8") as f:
+        html_contents = f.read()
+
+    subject = plan.get("paper_title") or "GOC DAILY MAIL TIMES"
+    if not subject.startswith("[GOC NEWS]"):
+        subject = f"[GOC NEWS] {subject}"
+
+    return send_mail_api(
+        sender_id=MAIL_SENDER_ID,
+        subject=subject,
+        contents=html_contents,
+        content_type="HTML",
+        doc_secu_type="PERSONAL",
+        recipients=MAIL_DEFAULT_RECIPIENTS
+    )
+
+
 # =========================================================
 # 메인
 # =========================================================
@@ -682,7 +775,11 @@ def main():
     output_path = "news_output_step2.html"
     render_newspaper_html_step2(plan, mails, output_path)
 
+    print("[4] 메일 발송 중...")
+    send_result = send_generated_news_mail(plan, output_path)
+
     print(f"[DONE] 완료: {output_path}")
+    print(f"[MAIL] 발송 결과: {send_result}")
 
 
 if __name__ == "__main__":
