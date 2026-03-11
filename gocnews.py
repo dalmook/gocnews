@@ -26,6 +26,7 @@ set LLM_SEND_SYSTEM_NAME=GOC_MAIL_RAG_PIPELINE
 import os
 import re
 import json
+import time
 import uuid
 import html
 import mimetypes
@@ -77,6 +78,8 @@ CATEGORY_STYLES = {
     "기타": {"label": "기타", "accent": "#666666", "bg": "#ebebeb"},
 }
 ISSUE_LINK_URL = "https://go/issueG"
+LLM_PLAN_MAX_ATTEMPTS = 3
+LLM_RETRY_DELAY_SEC = 5
 STRUCTURAL_LINE_PATTERNS = [
     r"(?im)^\s*lv\s*\d+\s*:\s*.*$",
     r"(?im)^\s*level\s*\d+\s*:\s*.*$",
@@ -807,7 +810,7 @@ def repair_plan_json(raw_content: str) -> Optional[Dict[str, Any]]:
     return try_parse_plan_json(repaired_content)
 
 
-def generate_newspaper_plan(mails: List[MailItem]) -> Dict[str, Any]:
+def generate_newspaper_plan(mails: List[MailItem]) -> Optional[Dict[str, Any]]:
     bundle = build_mail_bundle_for_llm(mails)
 
     system_prompt = """
@@ -882,23 +885,32 @@ def generate_newspaper_plan(mails: List[MailItem]) -> Dict[str, Any]:
 {bundle}
 """
 
-    result = call_gpt_oss(
-        prompt=user_prompt,
-        system_prompt=system_prompt,
-        temperature=0.2,
-        max_tokens=2200
-    )
+    last_error = ""
+    for attempt in range(1, LLM_PLAN_MAX_ATTEMPTS + 1):
+        result = call_gpt_oss(
+            prompt=user_prompt,
+            system_prompt=system_prompt,
+            temperature=0.2,
+            max_tokens=2200
+        )
 
-    if "error" in result:
-        return build_fallback_plan(mails, "자동 편집 응답을 받지 못해 원문 기반 브리핑으로 대체했습니다.")
+        if "error" in result:
+            last_error = result["error"]
+        else:
+            raw_content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
+            parsed = try_parse_plan_json(raw_content)
+            if parsed is None:
+                parsed = repair_plan_json(raw_content)
+            if parsed is not None:
+                return normalize_plan(parsed, mails)
+            last_error = "자동 편집 형식을 복구하지 못했습니다."
 
-    raw_content = result.get("choices", [{}])[0].get("message", {}).get("content", "")
-    parsed = try_parse_plan_json(raw_content)
-    if parsed is None:
-        parsed = repair_plan_json(raw_content)
-    if parsed is None:
-        return build_fallback_plan(mails, "자동 편집 형식을 복구하지 못해 원문 기반 브리핑으로 대체했습니다.")
-    return normalize_plan(parsed, mails)
+        print(f"[WARN] LLM 편집 실패 ({attempt}/{LLM_PLAN_MAX_ATTEMPTS}): {last_error}")
+        if attempt < LLM_PLAN_MAX_ATTEMPTS:
+            print(f"[INFO] {LLM_RETRY_DELAY_SEC}초 후 재시도합니다...")
+            time.sleep(LLM_RETRY_DELAY_SEC)
+
+    return None
 
 
 # =========================================================
@@ -1208,6 +1220,8 @@ def main():
 
     print("[2] 전체 메일 묶음을 신문 편집본으로 재구성 중...")
     plan = generate_newspaper_plan(mails)
+    if plan is None:
+        raise RuntimeError("LLM 편집본 생성에 실패했습니다. 메일 발송을 중단합니다.")
 
     print("[3] HTML 생성 중...")
     output_path = "news_output_step2.html"
