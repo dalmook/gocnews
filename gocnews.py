@@ -61,8 +61,19 @@ MAIL_API_CONFIG = {
 }
 MAIL_SENDER_ID = os.getenv("MAIL_SENDER_ID", "sungmook.cho").strip()
 MAIL_DEFAULT_RECIPIENTS = [
-    {"emailAddress": "sungmook.cho@samsung.com"}
+    {"emailAddress": "sungmook.cho@samsung.com", "recipientType": "TO"}
 ]
+CATEGORY_STYLES = {
+    "[HBM]": {"label": "HBM", "accent": "#c85c3d", "bg": "#f7e0d6"},
+    "[FLASH]": {"label": "FLASH", "accent": "#b26a00", "bg": "#f7ead2"},
+    "[물류]": {"label": "물류", "accent": "#7b7f2a", "bg": "#f2f0d6"},
+    "[MOBILE]": {"label": "MOBILE", "accent": "#2f7a55", "bg": "#ddf0e4"},
+    "[EDP]": {"label": "EDP", "accent": "#2f608d", "bg": "#ddeaf6"},
+    "[DO]": {"label": "DO", "accent": "#7c5a94", "bg": "#ebdff1"},
+    "[운영관리]": {"label": "운영관리", "accent": "#516b9a", "bg": "#e2e8f6"},
+    "[운영기획]": {"label": "운영기획", "accent": "#8f7d29", "bg": "#f3efcd"},
+    "기타": {"label": "기타", "accent": "#666666", "bg": "#ebebeb"},
+}
 
 
 # =========================================================
@@ -134,6 +145,12 @@ def send_mail_api(
     proxies: Optional[Dict[str, str]] = None,
     verify_ssl: bool = False, timeout: int = 30,
 ) -> Dict[str, Any]:
+    normalized_recipients = []
+    for recipient in recipients or []:
+        normalized = dict(recipient)
+        normalized.setdefault("recipientType", "TO")
+        normalized_recipients.append(normalized)
+
     headers_common = {
         "Authorization": MAIL_API_CONFIG["TOKEN"],
         "System-ID": MAIL_API_CONFIG["SYSTEM_ID"],
@@ -144,7 +161,7 @@ def send_mail_api(
         "contentType": content_type,
         "docSecuType": doc_secu_type,
         "sender": {"emailAddress": f"{sender_id}@samsung.com"},
-        "recipients": recipients or [],
+        "recipients": normalized_recipients,
     }
     if reserved_time:
         mail_json["reservedTime"] = reserved_time
@@ -160,7 +177,7 @@ def send_mail_api(
         headers["Content-Type"] = "application/json"
         response = session.post(
             url,
-            data=json.dumps(mail_json, ensure_ascii=False),
+            json=mail_json,
             headers=headers,
             verify=verify_ssl,
             timeout=timeout
@@ -186,7 +203,11 @@ def send_mail_api(
                 except Exception:
                     pass
 
-    response.raise_for_status()
+    if not response.ok:
+        raise requests.exceptions.HTTPError(
+            f"{response.status_code} Client Error: {response.text}",
+            response=response
+        )
     return response.json() if (response.text or "").strip() else {"ok": True}
 
 
@@ -245,6 +266,17 @@ def clean_text(text: str) -> str:
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\u200b", "", text)
     return text.strip()
+
+
+def summarize_text(text: str, max_length: int = 180) -> str:
+    text = clean_text(text)
+    if len(text) <= max_length:
+        return text
+    clipped = text[:max_length]
+    last_stop = max(clipped.rfind("."), clipped.rfind("!"), clipped.rfind("?"))
+    if last_stop >= int(max_length * 0.55):
+        return clipped[:last_stop + 1]
+    return clipped.rstrip() + "..."
 
 
 def html_to_text_basic(html_text: str) -> str:
@@ -318,6 +350,13 @@ def should_include_mail(subject: str, body: str, date_obj: Optional[datetime], c
         return False
 
     return True
+
+
+def get_mail_category(subject: str) -> str:
+    for keyword in FILTER_KEYWORDS:
+        if contains_any_keyword(subject, [keyword], ignore_spaces=True):
+            return keyword
+    return "기타"
 
 
 def extract_body_from_message(msg) -> str:
@@ -706,6 +745,64 @@ def render_bullet_block(items: List[str], limit: int) -> str:
     )
 
 
+def render_detail_table(mails: List[MailItem]) -> str:
+    if not mails:
+        return ""
+
+    grouped: Dict[str, List[MailItem]] = {}
+    for mail in mails:
+        category = get_mail_category(mail.subject)
+        grouped.setdefault(category, []).append(mail)
+
+    ordered_categories = [kw for kw in FILTER_KEYWORDS if kw in grouped]
+    if "기타" in grouped:
+        ordered_categories.append("기타")
+
+    sections = []
+    for category in ordered_categories:
+        style = CATEGORY_STYLES.get(category, CATEGORY_STYLES["기타"])
+        rows = []
+        for mail in grouped[category]:
+            date_str = mail.date_obj.strftime("%m-%d %H:%M") if mail.date_obj else mail.date_str
+            rows.append(
+                "<tr>"
+                f"<td style=\"padding:12px 10px;border-bottom:1px solid #e6dece;font-size:13px;line-height:1.6;color:#5e584f;vertical-align:top;white-space:nowrap;\">{esc(date_str)}</td>"
+                f"<td style=\"padding:12px 10px;border-bottom:1px solid #e6dece;font-size:13px;line-height:1.7;color:#2f2b25;vertical-align:top;font-weight:700;\">{esc(mail.sender)}</td>"
+                f"<td style=\"padding:12px 10px;border-bottom:1px solid #e6dece;font-size:14px;line-height:1.7;color:#191919;vertical-align:top;font-weight:700;\">{esc(mail.subject)}</td>"
+                f"<td style=\"padding:12px 10px;border-bottom:1px solid #e6dece;font-size:14px;line-height:1.8;color:#44403a;vertical-align:top;\">{esc_br(summarize_text(mail.body, 220))}</td>"
+                "</tr>"
+            )
+
+        sections.append(
+            "<tr>"
+            "<td style=\"padding:0 24px 22px 24px;\">"
+            "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"border:1px solid #d8cfbe;background-color:#fffdf9;\">"
+            "<tr>"
+            f"<td style=\"padding:14px 18px;background-color:{style['bg']};border-bottom:1px solid #d8cfbe;font-size:18px;line-height:1.4;font-weight:700;color:{style['accent']};\">"
+            f"{esc(style['label'])} | {len(grouped[category])}건"
+            "</td>"
+            "</tr>"
+            "<tr>"
+            "<td style=\"padding:0 16px 8px 16px;\">"
+            "<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:100%;\">"
+            "<tr>"
+            "<td style=\"padding:12px 10px;border-bottom:2px solid #cfc4af;font-size:12px;line-height:1.4;color:#7a7266;font-weight:700;\">DATE</td>"
+            "<td style=\"padding:12px 10px;border-bottom:2px solid #cfc4af;font-size:12px;line-height:1.4;color:#7a7266;font-weight:700;\">SENDER</td>"
+            "<td style=\"padding:12px 10px;border-bottom:2px solid #cfc4af;font-size:12px;line-height:1.4;color:#7a7266;font-weight:700;\">SUBJECT</td>"
+            "<td style=\"padding:12px 10px;border-bottom:2px solid #cfc4af;font-size:12px;line-height:1.4;color:#7a7266;font-weight:700;\">SUMMARY</td>"
+            "</tr>"
+            f"{''.join(rows)}"
+            "</table>"
+            "</td>"
+            "</tr>"
+            "</table>"
+            "</td>"
+            "</tr>"
+        )
+
+    return "".join(sections)
+
+
 def render_article_card(article: Dict[str, Any], mails: List[MailItem]) -> str:
     bullets_html = render_bullet_block(article.get("bullets", []) or [], 4)
     source_html = render_related_sources(article.get("related_mail_indexes", []), mails)
@@ -735,6 +832,7 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
     top = plan.get("top_story", {}) or {}
     top_bullets = render_bullet_block(top.get("bullets") or [], 5)
     top_sources = render_related_sources(top.get("related_mail_indexes", []), mails)
+    detail_sections_html = render_detail_table(mails)
 
     sections_html = ""
     for sec in plan.get("sections", []) or []:
@@ -825,6 +923,18 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
                         </td>
                     </tr>
                     {sections_html}
+                    <tr>
+                        <td style="padding:4px 24px 14px 24px;">
+                            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:3px solid #222222;">
+                                <tr>
+                                    <td style="padding:16px 0 16px 0;font-size:22px;line-height:1.3;font-weight:700;color:#1d1d1d;">
+                                        Raw Mail Digest
+                                    </td>
+                                </tr>
+                            </table>
+                        </td>
+                    </tr>
+                    {detail_sections_html}
                     <tr>
                         <td style="padding:18px 20px;border-top:1px solid #ddd7ca;background-color:#f4f1ea;text-align:center;font-size:12px;line-height:1.7;color:#777777;">
                             본 HTML은 사내 메일을 기반으로 자동 생성된 신문형 초안입니다.
