@@ -630,7 +630,7 @@ def build_category_bridge_articles(mails: List[MailItem], covered_categories: Op
         lead_idx, lead_mail = grouped[category][0]
         style = CATEGORY_STYLES.get(category, CATEGORY_STYLES["기타"])
         articles.append({
-            "headline": f"{style['label']} 주요 메일",
+            "headline": f"{style['label']} 관련 주요 내용",
             "summary": summarize_text(lead_mail.body, 260) or lead_mail.subject,
             "bullets": [f"{len(grouped[category])}건 메일 반영", lead_mail.subject[:100]],
             "related_mail_indexes": [lead_idx]
@@ -662,6 +662,41 @@ def ensure_category_coverage(plan: Dict[str, Any], mails: List[MailItem]) -> Dic
         "articles": missing_articles
     })
     plan["sections"] = sections
+    return plan
+
+
+def contains_english_title(text: str) -> bool:
+    if not text:
+        return False
+    latin_count = len(re.findall(r"[A-Za-z]", text))
+    korean_count = len(re.findall(r"[가-힣]", text))
+    return latin_count > 0 and latin_count >= korean_count
+
+
+def build_korean_fallback_headline(related_indexes: List[int], mails: List[MailItem]) -> str:
+    for idx in related_indexes or []:
+        if 1 <= idx <= len(mails):
+            subject = mails[idx - 1].subject
+            subject = re.sub(r"\[[^\]]+\]\s*", "", subject).strip()
+            if subject:
+                return subject
+    return "주요 이슈"
+
+
+def localize_plan_titles(plan: Dict[str, Any], mails: List[MailItem]) -> Dict[str, Any]:
+    top_story = plan.get("top_story") or {}
+    if contains_english_title(top_story.get("headline", "")):
+        top_story["headline"] = build_korean_fallback_headline(top_story.get("related_mail_indexes", []), mails)
+    if contains_english_title(top_story.get("subheadline", "")):
+        top_story["subheadline"] = ""
+    plan["top_story"] = top_story
+
+    for sec in plan.get("sections", []) or []:
+        if contains_english_title(sec.get("section_name", "")):
+            sec["section_name"] = "주요 기사"
+        for article in sec.get("articles", []) or []:
+            if contains_english_title(article.get("headline", "")):
+                article["headline"] = build_korean_fallback_headline(article.get("related_mail_indexes", []), mails)
     return plan
 
 
@@ -707,7 +742,8 @@ def normalize_plan(data: Dict[str, Any], mails: List[MailItem]) -> Dict[str, Any
         "sections": normalized_sections,
         "editor_note": clean_text(str(data.get("editor_note") or "주요 이슈를 주제별로 재정리했습니다."))[:220]
     }
-    return ensure_category_coverage(normalized, mails)
+    normalized = ensure_category_coverage(normalized, mails)
+    return localize_plan_titles(normalized, mails)
 
 
 def try_parse_plan_json(raw_content: str) -> Optional[Dict[str, Any]]:
@@ -809,6 +845,9 @@ def generate_newspaper_plan(mails: List[MailItem]) -> Dict[str, Any]:
 - 없는 내용 지어내지 말 것
 - 모든 문자열은 JSON 규칙에 맞게 큰따옴표 내부에만 작성
 - JSON 바깥 텍스트 절대 출력 금지
+- 기사 headline, subheadline, section_name은 가능하면 자연스러운 한국어 제목으로 작성
+- 단, 메일 본문에 포함된 제품명, 시스템명, 약어, 기술용어의 영어 표기는 임의로 번역하지 말고 원문을 유지
+- summary와 bullets에서도 원문 영어 용어를 억지로 한글화하지 말 것
 """
 
     user_prompt = f"""
@@ -958,7 +997,7 @@ def render_article_card(article: Dict[str, Any], mails: List[MailItem]) -> str:
             <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #d7cfbf;background:#ffffff;">
                 <tr>
                     <td style="padding:20px 22px 22px 22px;">
-                        <div style="font-size:12px;line-height:1.2;font-weight:700;letter-spacing:1px;color:#8a7b62;text-transform:uppercase;">Brief</div>
+                        <div style="font-size:12px;line-height:1.2;font-weight:700;letter-spacing:1px;color:#8a7b62;">주요 기사</div>
                         <div style="padding-top:8px;font-size:25px;line-height:1.35;font-weight:700;color:#161616;">{esc(article.get("headline"))}</div>
                         <div style="padding-top:12px;font-size:15px;line-height:1.9;color:#2f2b25;">{esc_br(article.get("summary"))}</div>
                         {bullets_html}
@@ -1014,7 +1053,7 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
                 <table role="presentation" width="760" cellpadding="0" cellspacing="0" style="width:760px;max-width:760px;background-color:#fcfaf4;border:1px solid #cfc4af;font-family:'Malgun Gothic','Apple SD Gothic Neo',Arial,sans-serif;color:#1d1d1d;">
                     <tr>
                         <td style="padding:14px 30px;background-color:#1a1a1a;text-align:center;">
-                            <div style="font-size:12px;line-height:1.4;font-weight:700;letter-spacing:1.6px;color:#f3ead7;">GOC INTERNAL EDITION</div>
+                            <div style="font-size:12px;line-height:1.4;font-weight:700;letter-spacing:1.2px;color:#f3ead7;">GOC 사내 주간 브리핑</div>
                         </td>
                     </tr>
                     <tr>
@@ -1047,7 +1086,8 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
                             <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="width:100%;border:1px solid #d8cfbe;background-color:#fffdf9;">
                                 <tr>
                                     <td style="padding:28px;">
-                                        <div style="display:inline-block;padding:6px 12px;background-color:#161616;color:#ffffff;font-size:12px;line-height:1.2;font-weight:700;letter-spacing:1px;">TOP STORY</div>
+                                        <div style="display:inline-block;padding:6px 12px;background-color:#161616;color:#ffffff;font-size:12px;line-height:1.2;font-weight:700;letter-spacing:1px;">대표 이슈</div>
+                                        
                                         <div style="padding-top:16px;font-size:38px;line-height:1.25;font-weight:700;color:#161616;">{esc(top.get("headline"))}</div>
                                         <div style="padding-top:10px;font-size:18px;line-height:1.7;color:#71695d;">{esc_br(top.get("subheadline"))}</div>
                                         <div style="padding-top:18px;font-size:17px;line-height:1.95;color:#2e2a24;">{esc_br(top.get("summary"))}</div>
@@ -1063,7 +1103,7 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
                             <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
                                 <tr>
                                     <td style="padding:18px 20px;border:1px solid #d8cfbe;background-color:#f7f1e5;">
-                                        <div style="font-size:12px;line-height:1.2;font-weight:700;letter-spacing:1px;color:#8a7b62;text-transform:uppercase;">Editor Note</div>
+                                        <div style="font-size:12px;line-height:1.2;font-weight:700;letter-spacing:1px;color:#8a7b62;">편집 노트</div>
                                         <div style="padding-top:10px;font-size:15px;line-height:1.9;color:#3f3a34;">{esc_br(plan.get("editor_note", ""))}</div>
                                     </td>
                                 </tr>
@@ -1076,7 +1116,7 @@ def render_newspaper_html_step2(plan: Dict[str, Any], mails: List[MailItem], out
                             <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:3px solid #222222;">
                                 <tr>
                                     <td style="padding:16px 0 16px 0;font-size:22px;line-height:1.3;font-weight:700;color:#1d1d1d;">
-                                        Raw Mail Digest
+                                        원문 메일 목록
                                     </td>
                                 </tr>
                             </table>
